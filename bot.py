@@ -400,17 +400,17 @@ def process_pending_notifications():
 # ============================================================
 # توابع کمکی برای ارسال درخواست‌ها
 # ============================================================
-def get_device_info(set_code):
+def get_device_info(set_code, bypass_cache=False):
     if not set_code:
         return None
     # ★ Pry-بررسی کش محلی در لحظه اول برای حذف درخواست‌های مکرر همزمان و افزایش بازدهی رم
-    if set_code in device_cache:
+    if not bypass_cache and set_code in device_cache:
         return device_cache[set_code]
         
     response = ws_client.send_sync('get_device', timeout=35, set_code=set_code)
     if response.get('error'):
         logger.error(f"Error getting device info: {response}")
-        return None
+        return device_cache.get(set_code) # بازگشت به مقدار کش در صورت خطا
         
     device = response.get('device')
     if device:
@@ -438,10 +438,12 @@ def get_stats():
         return {'total_users': 0, 'online_users': 0, 'offline_users': 0}
     return response.get('data', {'total_users': 0, 'online_users': 0, 'offline_users': 0})
 
-def add_command(set_code, command_type, params=None):
+def add_command(set_code, command_type, params=None, command_id=None):
     if not set_code or not command_type:
         return None
-    response = ws_client.send_sync('add_command', timeout=60, set_code=set_code, command_type=command_type, params=params or {})
+    if command_id is None:
+        command_id = int(time.time() * 1000)
+    response = ws_client.send_sync('add_command', timeout=60, set_code=set_code, command_type=command_type, params=params or {}, command_id=command_id)
     if response.get('error'):
         logger.error(f"Error adding command: {response}")
         return None
@@ -1049,7 +1051,8 @@ def show_device_info(chat_id, set_code, edit_message_id=None):
         msg = "❌ Invalid device code."
         safe_edit_or_send(chat_id, msg, edit_message_id)
         return False
-    device = get_device_info(set_code)
+    # همواره در هنگام باز کردن صریح پنل دستگاه، کش را دور بزن تا اطلاعات واقعی و زنده به کاربر نشان داده شود
+    device = get_device_info(set_code, bypass_cache=True)
     if not device:
         msg = f"❌ Device <code>{set_code}</code> not found."
         safe_edit_or_send(chat_id, msg, edit_message_id)
@@ -1083,29 +1086,37 @@ def show_device_info(chat_id, set_code, edit_message_id=None):
 # ارسال دستور به دستگاه (با timeout بیشتر)
 # ============================================================
 def send_command_to_device(chat_id, set_code, command_type, params=None, edit_message_id=None):
+    # ★ Pry-پیش‌تولید کاملاً هماهنگ شناسه دستور قبل از فرستادن به وب‌سوکت جهت رفع تداخل همزمانی میلی‌ثانیه‌ای (Race Condition)
+    command_id = int(time.time() * 1000)
+    
     # ★★★ برای PING، زمان ارسال دقیق ربات را ذخیره کن ★★★
     if command_type == "PING":
         send_time = time.time()
         if params is None:
             params = {}
         params['send_time'] = send_time
-    
-    command_id = add_command(set_code, command_type, params)
-    if not command_id:
-        msg = f"❌ Failed to send command <code>{command_type}</code>."
-        safe_edit_or_send(chat_id, msg, edit_message_id)
-        return False
         
-    msg = f"⚡ Command <code>{command_type}</code> sent to <code>{set_code}</code>."
-    safe_edit_or_send(chat_id, msg, edit_message_id)
-    
-    # ★ Pry-ثبت دستی command_id در pending_requests برای هماهنگی با لیسنر وب‌سوکت و رفع باگ تایم‌اوت مکرر
+    # ★ Pry-ثبت دستی و فوری شناسه در دایرکتوری در حال انتظار قبل از ارسال پیام وب‌سوکت
     ws_client.pending_requests[command_id] = {
         'received': False, 
         'command_type': command_type, 
         'chat_id': chat_id, 
         'edit_message_id': edit_message_id
     }
+    
+    sent_command_id = add_command(set_code, command_type, params, command_id=command_id)
+    if not sent_command_id:
+        msg = f"❌ Failed to send command <code>{command_type}</code>."
+        safe_edit_or_send(chat_id, msg, edit_message_id)
+        # تمیزکاری کش در صورت شکست ارسال اولیه
+        try:
+            del ws_client.pending_requests[command_id]
+        except KeyError:
+            pass
+        return False
+        
+    msg = f"⚡ Command <code>{command_type}</code> sent to <code>{set_code}</code>."
+    safe_edit_or_send(chat_id, msg, edit_message_id)
     
     def check_and_send_result():
         # بررسی سریع‌تر ثانیه‌ای برای پاسخ آنی بدون تاخیر ۶۰ ثانیه‌ای
