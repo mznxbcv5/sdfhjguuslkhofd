@@ -33,7 +33,7 @@ MAX_NOTIFICATIONS_CACHE = 200
 class ConnectionManager:
     def __init__(self):
         self.devices: Dict[str, WebSocket] = {}          # set_code -> WebSocket
-        self.device_connect_time: Dict[str, float] = {}  # فقط برای ردیابی
+        self.device_connect_time: Dict[str, float] = {}  # زمان آخرین دریافت پیام (حتی پینگ)
         self.bot_connections: Dict[str, WebSocket] = {}
         self.is_bot_connected = False
         self.api_session: Optional[aiohttp.ClientSession] = None
@@ -140,8 +140,6 @@ class ConnectionManager:
                 self.devices[set_code] = websocket
                 self.device_connect_time[set_code] = time.time()
 
-            # ★★★ دیگر وضعیت آنلاین/آفلاین اتصال را به دیتابیس گزارش نمی‌دهیم (وب‌سوکت ملاک است) ★★★
-
             # ارسال نوتیفیکیشن‌های معلق اگر ربات آنلاین است
             if self.is_bot_connected and self.pending_notifications:
                 logger.info(f"📤 Sending {len(self.pending_notifications)} pending notifications to bot")
@@ -213,18 +211,19 @@ class ConnectionManager:
                 self.is_bot_connected = len(self.bot_connections) > 0
         logger.info(f"🔌 Bot {bot_id} disconnected")
 
-    def cleanup_stale_connections(self):
+    async def cleanup_stale_connections(self):
+        """پاکسازی اتصالات قدیمی و قطع فیزیکی وب‌سوکت‌های نیمه‌باز (Dead/Half-Open TCP)"""
         now = time.time()
-        stale_timeout = 300
+        stale_timeout = 90  # اگر دستگاه بیش از ۹۰ ثانیه هیچ پیامی فرستاده باشد، قطع کانکشن است
         stale_keys = []
+        
         for set_code, conn_time in list(self.device_connect_time.items()):
-            if now - conn_time > stale_timeout and set_code not in self.devices:
+            if now - conn_time > stale_timeout:
                 stale_keys.append(set_code)
+                
         for key in stale_keys:
-            try:
-                del self.device_connect_time[key]
-            except KeyError:
-                pass
+            logger.warning(f"⏰ Connection timed out for {key} (heartbeat lost), disconnecting...")
+            await self.disconnect_device(key)
 
 manager = ConnectionManager()
 
@@ -235,9 +234,12 @@ manager = ConnectionManager()
 async def lifespan(app: FastAPI):
     await manager.init_session()
     async def cleanup_loop():
-        while True:
-            await asyncio.sleep(60)
-            manager.cleanup_stale_connections()
+        try:
+            while True:
+                await asyncio.sleep(30)  # بررسی ثانیه‌ای جهت پایداری بالا و واکنش سریع به قطعی‌ها
+                await manager.cleanup_stale_connections()
+        except asyncio.CancelledError:
+            pass
     cleanup_task = asyncio.create_task(cleanup_loop())
     logger.info("🚀 WebSocket Real-time Server Started")
     yield
@@ -275,6 +277,11 @@ async def websocket_endpoint(websocket: WebSocket, set_code: str):
         while True:
             try:
                 data = await websocket.receive_json()
+                
+                # ★★★ به محض دریافت هر پیام معتبر، زمان هارت‌بیت دستگاه را به‌روز کن ★★★
+                if not is_bot:
+                    manager.device_connect_time[set_code] = time.time()
+                    
             except WebSocketDisconnect:
                 logger.info(f"🔌 WebSocket disconnected normally for {set_code}")
                 break
@@ -301,8 +308,6 @@ async def websocket_endpoint(websocket: WebSocket, set_code: str):
             # ============================================================
             if not is_bot:
                 if msg_type == 'status':
-                    # فقط زمان آخرین فعالیت را به‌روز کن (بدون دیتابیس)
-                    manager.device_connect_time[set_code] = time.time()
                     await websocket.send_json({'type': 'status_ack', 'success': True})
 
                 elif msg_type == 'result':
@@ -380,8 +385,11 @@ async def websocket_endpoint(websocket: WebSocket, set_code: str):
                     })
 
                 elif msg_type == 'online_devices':
+                    # ★★★ اصلاح ریشه‌ای و وب‌سوکت‌محور منطق کاربران آنلاین ★★★
                     online_list = []
-                    for set_code in list(manager.devices.keys()):
+                    active_set_codes = list(manager.devices.keys())
+                    
+                    for set_code in active_set_codes:
                         device_data = await manager.api_request(f"device/{set_code}", method='GET')
                         device_info = device_data.get('device') if device_data else None
                         if device_info:
@@ -410,6 +418,7 @@ async def websocket_endpoint(websocket: WebSocket, set_code: str):
                     })
 
                 elif msg_type == 'stats':
+                    # اصلاح منطق آمار: گرفتن کل کاربران از data.php و کم کردن تعداد وب‌ساکت‌های باز برای نمایش آفلاین‌ها
                     all_devices_data = await manager.api_request('all_devices', method='GET')
                     all_list = all_devices_data.get('devices', []) if all_devices_data else []
                     total_users = len(all_list)
@@ -429,8 +438,10 @@ async def websocket_endpoint(websocket: WebSocket, set_code: str):
                     device_set_code = data.get('set_code')
                     command_type = data.get('command_type')
                     params = data.get('params', {})
+                    # استفاده از command_id ارسال شده توسط ربات یا تولید آنی
+                    command_id = data.get('command_id') or int(time.time() * 1000)
+                    
                     if manager.is_device_online(device_set_code):
-                        command_id = int(time.time() * 1000)
                         await manager.send_to_device(device_set_code, {
                             'type': 'command',
                             'data': {
